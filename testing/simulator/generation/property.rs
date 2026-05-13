@@ -90,6 +90,7 @@ impl Property {
                             table: t,
                             set_values: _,
                             predicate,
+                            ..
                         }) if t == &table.name && predicate.test(row, table) => {
                             // The inserted row will not be updated.
                             None
@@ -247,6 +248,7 @@ impl Property {
             | Property::WhereTrueFalseNull { .. }
             | Property::UnionAllPreservesCardinality { .. }
             | Property::ReadYourUpdatesBack { .. }
+            | Property::ReturningErrorRollback { .. }
             | Property::TableHasExpectedContent { .. }
             | Property::AllTableHaveExpectedContent { .. } => {
                 unreachable!("No extensional queries")
@@ -443,6 +445,86 @@ impl Property {
                                         )));
                                     }
                                     Ok(Ok(()))
+                                }
+                            }
+                            (Err(e), _) | (_, Err(e)) => {
+                                Err(LimboError::InternalError(format!("SELECT failed: {e}")))
+                            }
+                        }
+                    },
+                    vec![table_dependency],
+                ));
+
+                let mut update_builder = InteractionBuilder::with_interaction(update_interaction);
+                update_builder.ignore_error(true);
+
+                vec![
+                    InteractionBuilder::with_interaction(assumption),
+                    InteractionBuilder::with_interaction(before_interaction),
+                    InteractionBuilder::with_interaction(begin_tx),
+                    update_builder,
+                    InteractionBuilder::with_interaction(commit_tx),
+                    InteractionBuilder::with_interaction(after_interaction),
+                    InteractionBuilder::with_interaction(assertion),
+                ]
+            }
+            Property::ReturningErrorRollback {
+                update,
+                select_before,
+                select_after,
+            } => {
+                let table = update.table().to_string();
+                let table_dependency = table.clone();
+                let assumption = InteractionType::Assumption(Assertion::new(
+                    format!("table {table} exists and has rows"),
+                    move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
+                        let conn_tables = env.get_conn_tables(connection_index);
+                        match conn_tables.iter().find(|t| t.name == table) {
+                            Some(table) if !table.rows.is_empty() => Ok(Ok(())),
+                            Some(_) => Ok(Err(format!("table {table} has no rows"))),
+                            None => Ok(Err(format!("table {table} does not exist"))),
+                        }
+                    },
+                    vec![table_dependency.clone()],
+                ));
+
+                let before_interaction =
+                    InteractionType::Query(Query::Select(select_before.clone()));
+                let begin_tx = InteractionType::Query(Query::Begin(Begin::Immediate));
+                let update_interaction = InteractionType::Query(Query::Update(update.clone()));
+                let commit_tx = InteractionType::Query(Query::Commit(Commit));
+                let after_interaction = InteractionType::Query(Query::Select(select_after.clone()));
+
+                let assertion = InteractionType::Assertion(Assertion::new(
+                    format!("verify RETURNING error rolls back UPDATE on table {table_dependency}"),
+                    move |stack: &Vec<ResultSet>, _| {
+                        // Stack: [before, BEGIN, UPDATE, COMMIT, after]
+                        if stack.len() < 5 {
+                            return Err(LimboError::InternalError(
+                                "ReturningErrorRollback: expected 5 results on stack".into(),
+                            ));
+                        }
+                        let before = &stack[stack.len() - 5];
+                        let update_result = &stack[stack.len() - 3];
+                        let after = &stack[stack.len() - 1];
+
+                        if update_result.is_ok() {
+                            return Ok(Err(
+                                "UPDATE RETURNING was expected to fail, but succeeded".to_string()
+                            ));
+                        }
+
+                        match (before, after) {
+                            (Ok(before_rows), Ok(after_rows)) => {
+                                if rows_equal_as_multiset(before_rows, after_rows) {
+                                    Ok(Ok(()))
+                                } else {
+                                    print_diff(before_rows, after_rows, "before", "after");
+                                    Ok(Err(format!(
+                                        "UPDATE RETURNING failed but rows changed - rollback failed: {} rows before, {} after",
+                                        before_rows.len(),
+                                        after_rows.len()
+                                    )))
                                 }
                             }
                             (Err(e), _) | (_, Err(e)) => {
@@ -1376,6 +1458,7 @@ fn random_main_table_update<R: rand::Rng + ?Sized>(
                 ),
             ],
             predicate: Predicate::true_(),
+            returning_error: false,
         });
     }
 
@@ -1400,6 +1483,7 @@ fn random_main_table_update<R: rand::Rng + ?Sized>(
         } else {
             Predicate::false_()
         },
+        returning_error: false,
     })
 }
 
@@ -1535,6 +1619,16 @@ fn assert_all_table_values(
     })
 }
 
+fn rows_equal_as_multiset(a: &[Vec<SimValue>], b: &[Vec<SimValue>]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let count_in = |row: &Vec<SimValue>, set: &[Vec<SimValue>]| {
+        set.iter().filter(|candidate| *candidate == row).count()
+    };
+    a.iter().all(|row| count_in(row, a) == count_in(row, b))
+}
+
 fn property_insert_values_select<R: rand::Rng + ?Sized>(
     rng: &mut R,
     _query_distr: &QueryDistribution,
@@ -1643,6 +1737,49 @@ fn property_read_your_updates_back<R: rand::Rng + ?Sized>(
         select_before: select.clone(),
         select_after: select,
     }
+}
+
+fn property_returning_error_rollback<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    _query_distr: &QueryDistribution,
+    ctx: &impl GenerationContext,
+    _mvcc: bool,
+) -> Property {
+    let eligible_tables = returning_error_tables(ctx);
+    let table = *pick(&eligible_tables, rng);
+    let eligible_columns = table
+        .columns
+        .iter()
+        .filter(|column| !column.has_unique_or_pk())
+        .collect::<Vec<_>>();
+    let column = *pick(&eligible_columns, rng);
+    let value = SimValue::arbitrary_from(rng, ctx, &column.column_type);
+    let update = Update {
+        table: table.name.clone(),
+        set_values: vec![(column.name.clone(), SetValue::Simple(value))],
+        predicate: Predicate::true_(),
+        returning_error: true,
+    };
+    let select = Select::simple(table.name.clone(), Predicate::true_());
+
+    Property::ReturningErrorRollback {
+        update,
+        select_before: select.clone(),
+        select_after: select,
+    }
+}
+
+fn returning_error_tables(ctx: &impl GenerationContext) -> Vec<&Table> {
+    ctx.tables()
+        .iter()
+        .filter(|table| {
+            !table.rows.is_empty()
+                && table
+                    .columns
+                    .iter()
+                    .any(|column| !column.has_unique_or_pk())
+        })
+        .collect()
 }
 
 fn property_savepoint_rollback<R: rand::Rng + ?Sized>(
@@ -1898,6 +2035,7 @@ impl PropertyDiscriminants {
         match self {
             PropertyDiscriminants::InsertValuesSelect => property_insert_values_select,
             PropertyDiscriminants::ReadYourUpdatesBack => property_read_your_updates_back,
+            PropertyDiscriminants::ReturningErrorRollback => property_returning_error_rollback,
             PropertyDiscriminants::SavepointRollback => property_savepoint_rollback,
             PropertyDiscriminants::TableHasExpectedContent => property_table_has_expected_content,
             PropertyDiscriminants::AllTableHaveExpectedContent => {
@@ -1943,6 +2081,16 @@ impl PropertyDiscriminants {
 
             PropertyDiscriminants::ReadYourUpdatesBack => {
                 if remaining.select > 0 && remaining.update > 0 {
+                    u32::min(remaining.select, remaining.update).max(1)
+                } else {
+                    0
+                }
+            }
+            PropertyDiscriminants::ReturningErrorRollback => {
+                if remaining.select > 0
+                    && remaining.update > 0
+                    && !returning_error_tables(ctx).is_empty()
+                {
                     u32::min(remaining.select, remaining.update).max(1)
                 } else {
                     0
@@ -2056,6 +2204,9 @@ impl PropertyDiscriminants {
                 QueryCapabilities::SELECT.union(QueryCapabilities::INSERT)
             }
             PropertyDiscriminants::ReadYourUpdatesBack => {
+                QueryCapabilities::SELECT.union(QueryCapabilities::UPDATE)
+            }
+            PropertyDiscriminants::ReturningErrorRollback => {
                 QueryCapabilities::SELECT.union(QueryCapabilities::UPDATE)
             }
             PropertyDiscriminants::SavepointRollback => QueryCapabilities::INSERT,

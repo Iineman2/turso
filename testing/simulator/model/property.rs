@@ -51,6 +51,25 @@ pub enum Property {
         select_before: Select,
         select_after: Select,
     },
+    /// ReturningErrorRollback verifies that a post-write RETURNING error rolls
+    /// back the DML statement without aborting the surrounding transaction.
+    ///
+    /// Execution:
+    ///     SELECT * FROM <t>
+    ///     BEGIN IMMEDIATE
+    ///     UPDATE <t> SET <col> = <value> WHERE TRUE
+    ///       RETURNING <expression that errors>
+    ///     COMMIT
+    ///     SELECT * FROM <t>
+    ///
+    /// Assertion:
+    /// - UPDATE must fail
+    /// - before == after (the failed statement did not persist changes)
+    ReturningErrorRollback {
+        update: Update,
+        select_before: Select,
+        select_after: Select,
+    },
     /// TableHasExpectedContent is a property in which the table
     /// must have the expected content, i.e. all the insertions and
     /// updates and deletions should have been persisted in the way
@@ -238,6 +257,7 @@ impl Property {
             | Property::WhereTrueFalseNull { .. }
             | Property::UnionAllPreservesCardinality { .. }
             | Property::ReadYourUpdatesBack { .. }
+            | Property::ReturningErrorRollback { .. }
             | Property::TableHasExpectedContent { .. }
             | Property::AllTableHaveExpectedContent { .. } => None,
         }

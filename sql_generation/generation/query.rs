@@ -743,6 +743,7 @@ impl Arbitrary for Update {
             table: table.name.clone(),
             set_values,
             predicate,
+            returning_error: false,
         }
     }
 }

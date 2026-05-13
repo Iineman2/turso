@@ -44,6 +44,8 @@ pub struct Update {
     pub table: String,
     pub set_values: Vec<(String, SetValue)>, // Pair of value for set expressions => SET name=value
     pub predicate: Predicate,
+    #[serde(default)]
+    pub returning_error: bool,
 }
 
 impl Update {
@@ -62,6 +64,9 @@ impl Display for Update {
             write!(f, "{name} = {value}")?;
         }
         write!(f, " WHERE {}", self.predicate)?;
+        if self.returning_error {
+            write!(f, " RETURNING 'x' LIKE 'x' ESCAPE 'yy'")?;
+        }
         Ok(())
     }
 }
